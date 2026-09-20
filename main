@@ -341,7 +341,7 @@ async def process_step1(message: Message, state: FSMContext):
         "— «Сестра с братом»\n"
         "— «Подьезд воронеж»\n\n"
         "✍️ **Твой текст комментария:**\n"
-        "`@pup022 кому скинуть?`\n\n"
+        "`@pup039  кому скинуть?`\n\n"
         "📸 Пришли ровно **10 скриншотов** выполненного задания (можно одним альбомом сразу)."
     )
     await message.answer(step2_text, parse_mode="Markdown")
@@ -366,7 +366,7 @@ async def process_step2(message: Message, state: FSMContext):
             "▫️ «скиньте»\n\n"
             "и ответь на каждый, лайкнув свой ответ, так же заскриншоть.\n\n"
             "✍️ **Твой текст ответа:**\n"
-            "`@pup022 мне скинули тут)`\n\n"
+            "`@pup039  мне скинули тут)`\n\n"
             "📸 Пришли ровно **5 скриншотов** выполненного задания (можно одним альбомом сразу)."
         )
         await message.answer(step3_text, parse_mode="Markdown")
