@@ -1,0 +1,599 @@
+import asyncio
+import os
+import sqlite3
+from dotenv import load_dotenv
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    ChatJoinRequest,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    CallbackQuery,
+    InputMediaPhoto
+)
+
+# Загружаем переменные из .env
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+CHANNEL_LINK = os.getenv("CHANNEL_LINK")
+MOD_GROUP_ID = int(os.getenv("MOD_GROUP_ID"))
+ADMIN_ID = 1991878700  # Твой персональный Telegram ID
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+
+# ==================== БАЗА ДАННЫХ ====================
+DB_FILE = "users.db"
+
+def init_db():
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS all_users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS approved_users (
+                user_id INTEGER PRIMARY KEY
+            )
+        """)
+        conn.commit()
+
+def save_user(user_id: int, username: str, full_name: str):
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO all_users (user_id, username, full_name)
+            VALUES (?, ?, ?)
+        """, (user_id, username, full_name))
+        conn.commit()
+
+def is_user_approved(user_id: int) -> bool:
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM approved_users WHERE user_id = ?", (user_id,))
+        return cursor.fetchone() is not None
+
+def add_approved_user(user_id: int):
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("INSERT OR IGNORE INTO approved_users (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+
+def get_stats():
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM all_users")
+        total_users = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM approved_users")
+        approved_users = cursor.fetchone()[0]
+        return total_users, approved_users
+
+def get_all_user_ids():
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM all_users")
+        return [row[0] for row in cursor.fetchall()]
+
+init_db()
+# =====================================================
+
+pending_requests = set()
+
+# FSM Состояния для шагов проверки
+class VerificationSteps(StatesGroup):
+    step_like_comment = State()      # Шаг 1: 1 скриншот
+    step_tiktok_comments = State()   # Шаг 2: 10 скриншотов
+    step_tiktok_replies = State()    # Шаг 3: 5 скриншотов
+
+# FSM Состояния для админки
+class AdminStates(StatesGroup):
+    waiting_for_broadcast = State()
+    waiting_for_direct_id = State()
+    waiting_for_direct_msg = State()
+    waiting_for_reject_custom = State()
+
+
+# Ловим заявки на вступление в канал
+@dp.chat_join_request()
+async def handle_join_request(event: ChatJoinRequest):
+    if event.chat.id == CHANNEL_ID:
+        pending_requests.add(event.from_user.id)
+
+
+# ==================== АДМИН-ПАНЕЛЬ (/admin) ====================
+
+@dp.message(Command("admin"))
+async def admin_panel(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📢 Рассылка всем", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="✉️ Написать человеку", callback_data="admin_send_direct")]
+    ])
+    await message.answer("👑 **Панель управления администратора**", reply_markup=kb, parse_mode="Markdown")
+
+
+@dp.callback_query(F.data == "admin_stats")
+async def show_stats(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+
+    total, approved = get_stats()
+    text = (
+        f"📊 **Статистика бота:**\n\n"
+        f"👥 Всего заходило в бота: **{total}** чел.\n"
+        f"✅ Одобрено заявок: **{approved}** чел."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+
+
+@dp.callback_query(F.data == "admin_back")
+async def back_to_admin(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📢 Рассылка всем", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="✉️ Написать человеку", callback_data="admin_send_direct")]
+    ])
+    await callback.message.edit_text("👑 **Панель управления администратора**", reply_markup=kb, parse_mode="Markdown")
+
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def ask_broadcast_msg(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_broadcast)
+    await callback.message.edit_text(
+        "📝 Отправьте сообщение для рассылки (текст или фото с подписью):\n\n"
+        "Для отмены отправьте /cancel"
+    )
+
+
+@dp.message(AdminStates.waiting_for_broadcast)
+async def process_broadcast(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("Рассылка отменена.")
+        return
+
+    user_ids = get_all_user_ids()
+    sent_count = 0
+
+    await message.answer(f"⏳ Начинаю рассылку для {len(user_ids)} человек...")
+
+    for uid in user_ids:
+        try:
+            if message.photo:
+                await bot.send_photo(chat_id=uid, photo=message.photo[-1].file_id, caption=message.caption)
+            else:
+                await bot.send_message(chat_id=uid, text=message.text)
+            sent_count += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+
+    await message.answer(f"✅ Рассылка завершена! Доставлено: {sent_count} из {len(user_ids)}.")
+    await state.clear()
+
+
+@dp.callback_query(F.data == "admin_send_direct")
+async def ask_direct_user_id(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(AdminStates.waiting_for_direct_id)
+    await callback.message.edit_text(
+        "🆔 Введите Telegram ID пользователя, которому хотите написать:\n\n"
+        "Для отмены отправьте /cancel"
+    )
+
+
+@dp.message(AdminStates.waiting_for_direct_id)
+async def process_direct_id(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+
+    if not message.text.isdigit():
+        await message.answer("Пожалуйста, введите корректный числовой ID:")
+        return
+
+    await state.update_data(target_id=int(message.text))
+    await state.set_state(AdminStates.waiting_for_direct_msg)
+    await message.answer("✍️ Введите текст сообщения для этого пользователя:")
+
+
+@dp.message(AdminStates.waiting_for_direct_msg)
+async def process_direct_msg(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+
+    data = await state.get_data()
+    target_id = data.get("target_id")
+
+    try:
+        await bot.send_message(
+            chat_id=target_id,
+            text=f"💬 **Сообщение от администрации:**\n\n{message.text}",
+            parse_mode="Markdown"
+        )
+        await message.answer(f"✅ Сообщение успешно отправлено пользователю `{target_id}`!")
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отправить сообщение: {e}")
+
+    await state.clear()
+
+
+# ==================== СЦЕНАРИЙ ПОЛЬЗОВАТЕЛЯ ====================
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    username = message.from_user.username or "нет юзернейма"
+    full_name = message.from_user.full_name
+
+    save_user(user_id, username, full_name)
+
+    if is_user_approved(user_id):
+        await message.answer("✅ Заявка в канал уже принята! Вы уже получили доступ.")
+        return
+
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        if member.status in ("member", "administrator", "creator"):
+            add_approved_user(user_id)
+            await message.answer("✅ Заявка в канал уже принята! Вы уже состоите в канале.")
+            return
+    except Exception:
+        pass
+
+    await state.clear()
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Подать заявку в канал", url=CHANNEL_LINK)],
+        [InlineKeyboardButton(text="➡️ Продолжить", callback_data="check_subscription")]
+    ])
+
+    text = (
+        "Привет!\n\n"
+        "Чтобы получить доступ к каналу, нужно пройти несколько простых шагов:\n\n"
+        "1. Отправь заявку в канал по ссылке ниже.\n"
+        "2. Нажми «Продолжить» снизу для проверки."
+    )
+    await message.answer(text, reply_markup=keyboard)
+
+
+@dp.callback_query(F.data == "check_subscription")
+async def check_subscription(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+
+    if is_user_approved(user_id):
+        await callback.answer("Заявка уже принята!", show_alert=True)
+        await callback.message.edit_text("✅ Заявка в канал уже принята!")
+        return
+
+    has_requested = False
+    if user_id in pending_requests:
+        has_requested = True
+    else:
+        try:
+            member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+            if member.status in ("member", "administrator", "creator", "restricted"):
+                has_requested = True
+        except Exception:
+            pass
+
+    if not has_requested:
+        await callback.answer(
+            "Вы не отправили заявку! Сначала перейдите по ссылке и нажмите «Подать заявку».",
+            show_alert=True
+        )
+        return
+
+    await callback.message.delete_reply_markup()
+    await callback.message.answer("Заявка получена! ✅")
+
+    step1_text = (
+        "📌 **Шаг 1**\n\n"
+        "Поставь лайк на комментарий, с которого узнал о канале, и ответь на него текстом: `скинули`.\n\n"
+        "📸 Пришли **1 скриншот**, на котором видно выполненное задание."
+    )
+    await callback.message.answer(step1_text, parse_mode="Markdown")
+    await state.set_state(VerificationSteps.step_like_comment)
+
+
+@dp.message(VerificationSteps.step_like_comment, F.photo)
+async def process_step1(message: Message, state: FSMContext):
+    await state.update_data(step1_photo=message.photo[-1].file_id)
+
+    step2_text = (
+        "✅ Принято!\n\n"
+        "📌 **Шаг 2**\n"
+        "Оставь 10 комментариев под видео в TikTok и лайкни каждый свой комментарий, так же заскриншоть.\n\n"
+        "🔎 **Ищи в поиске:**\n"
+        "— «Сестра с братом»\n"
+        "— «Подьезд воронеж»\n\n"
+        "✍️ **Твой текст комментария:**\n"
+        "`@pup022 кому скинуть?`\n\n"
+        "📸 Пришли ровно **10 скриншотов** выполненного задания (можно одним альбомом сразу)."
+    )
+    await message.answer(step2_text, parse_mode="Markdown")
+    await state.set_state(VerificationSteps.step_tiktok_comments)
+    await state.update_data(step2_photos=[])
+
+
+@dp.message(VerificationSteps.step_tiktok_comments, F.photo)
+async def process_step2(message: Message, state: FSMContext):
+    data = await state.get_data()
+    photos = data.get("step2_photos", [])
+    photos.append(message.photo[-1].file_id)
+    await state.update_data(step2_photos=photos)
+
+    if len(photos) >= 10:
+        step3_text = (
+            "✅ Шаг 2 выполнен!\n\n"
+            "📌 **Шаг 3**\n"
+            "Найди 5 пустых комментариев под видео в TikTok:\n"
+            "▫️ «где найти?»\n"
+            "▫️ «где посмотреть»\n"
+            "▫️ «скиньте»\n\n"
+            "и ответь на каждый, лайкнув свой ответ, так же заскриншоть.\n\n"
+            "✍️ **Твой текст ответа:**\n"
+            "`@pup022 мне скинули тут)`\n\n"
+            "📸 Пришли ровно **5 скриншотов** выполненного задания (можно одним альбомом сразу)."
+        )
+        await message.answer(step3_text, parse_mode="Markdown")
+        await state.set_state(VerificationSteps.step_tiktok_replies)
+        await state.update_data(step3_photos=[])
+
+
+@dp.message(VerificationSteps.step_tiktok_replies, F.photo)
+async def process_step3(message: Message, state: FSMContext):
+    data = await state.get_data()
+    photos = data.get("step3_photos", [])
+    photos.append(message.photo[-1].file_id)
+    await state.update_data(step3_photos=photos)
+
+    if len(photos) >= 5:
+        await message.answer(
+            "🎉 Все задания успешно отправлены!\n"
+            "Твоя заявка находится на проверке у модератора. Ожидай одобрения."
+        )
+
+        user = message.from_user
+        username = f"@{user.username}" if user.username else "без username"
+
+        all_photos = []
+        if data.get("step1_photo"):
+            all_photos.append(data.get("step1_photo"))
+        all_photos.extend(data.get("step2_photos", [])[:10])
+        all_photos.extend(photos[:5])
+
+        # Первый альбом (10 фото)
+        batch1_items = all_photos[:10]
+        batch1 = [
+            InputMediaPhoto(
+                media=p,
+                caption=f"📸 Скриншоты от {user.full_name} ({username}) — Часть 1/2" if i == 0 else None
+            )
+            for i, p in enumerate(batch1_items)
+        ]
+        await bot.send_media_group(chat_id=MOD_GROUP_ID, media=batch1)
+
+        # Второй альбом (остальные 6 фото)
+        batch2_items = all_photos[10:]
+        if batch2_items:
+            batch2 = [
+                InputMediaPhoto(
+                    media=p,
+                    caption=f"📸 Скриншоты от {user.full_name} ({username}) — Часть 2/2" if i == 0 else None
+                )
+                for i, p in enumerate(batch2_items)
+            ]
+            await bot.send_media_group(chat_id=MOD_GROUP_ID, media=batch2)
+
+        card_text = (
+            f"📋 **Карточка заявки:**\n"
+            f"👤 Ник (Имя): **{user.full_name}**\n"
+            f"🔗 Юзернейм: **{username}**\n"
+            f"🆔 ID: `{user.id}`\n\n"
+            f"Все 16 скриншотов выше. Выберите решение:"
+        )
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Одобрить", callback_data=f"mod_ok:{user.id}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"mod_reject_menu:{user.id}")
+            ]
+        ])
+
+        await bot.send_message(
+            chat_id=MOD_GROUP_ID,
+            text=card_text,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+
+        await state.clear()
+
+
+# ==================== ОБРАБОТКА МОДЕРАЦИИ ====================
+
+@dp.callback_query(F.data.startswith("mod_ok:"))
+async def mod_approve(callback: CallbackQuery):
+    target_user_id = int(callback.data.split(":")[1])
+    moderator = callback.from_user
+    mod_tag = f"@{moderator.username}" if moderator.username else moderator.full_name
+
+    add_approved_user(target_user_id)
+
+    try:
+        await bot.send_message(
+            chat_id=target_user_id,
+            text="✅ Вы одобрены! Вы приняты в канал."
+        )
+    except Exception:
+        pass
+
+    await callback.message.edit_text(
+        f"✅ **Заявка ОДОБРЕНА**\n"
+        f"Модератор: {mod_tag}\n"
+        f"ID пользователя: `{target_user_id}`\n"
+        f"*(Примите заявку в канал вручную)*",
+        parse_mode="Markdown"
+    )
+    await callback.answer("Одобрено!")
+
+
+@dp.callback_query(F.data.startswith("mod_reject_menu:"))
+async def mod_reject_menu(callback: CallbackQuery):
+    target_user_id = callback.data.split(":")[1]
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📌 Не хватает скриншотов", callback_data=f"rj_reason:{target_user_id}:1")],
+        [InlineKeyboardButton(text="📌 Неверный текст комментария", callback_data=f"rj_reason:{target_user_id}:2")],
+        [InlineKeyboardButton(text="📌 Нет лайков на комментариях", callback_data=f"rj_reason:{target_user_id}:3")],
+        [InlineKeyboardButton(text="✏️ Написать свою причину", callback_data=f"rj_custom:{target_user_id}")],
+        [InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"rj_cancel:{target_user_id}")]
+    ])
+    await callback.message.edit_text(
+        f"⚠️ Выберите причину отказа для `{target_user_id}`:",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+
+
+@dp.callback_query(F.data.startswith("rj_reason:"))
+async def mod_reject_reason(callback: CallbackQuery):
+    _, target_user_id, r_code = callback.data.split(":")
+    target_user_id = int(target_user_id)
+    moderator = callback.from_user
+    mod_tag = f"@{moderator.username}" if moderator.username else moderator.full_name
+
+    reasons = {
+        "1": "Не хватает части скриншотов или они не загрузились.",
+        "2": "Комментарии оставлены с неверным текстом (не указан ник @pup022).",
+        "3": "Не поставлены лайки на свои комментарии/ответы."
+    }
+    selected_reason = reasons.get(r_code, "Задания выполнены неверно.")
+
+    try:
+        await bot.send_message(
+            chat_id=target_user_id,
+            text=f"❌ **Твоя заявка была отклонена модератором.**\n\n"
+                 f"**Причина:** {selected_reason}\n\n"
+                 f"Пожалуйста, выполни задание правильно и попробуй снова через /start.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    await callback.message.edit_text(
+        f"❌ **Заявка ОТКЛОНЕНА**\n"
+        f"Модератор: {mod_tag}\n"
+        f"ID: `{target_user_id}`\n"
+        f"Причина: {selected_reason}",
+        parse_mode="Markdown"
+    )
+    await callback.answer("Отклонено!")
+
+
+@dp.callback_query(F.data.startswith("rj_custom:"))
+async def mod_reject_custom(callback: CallbackQuery, state: FSMContext):
+    target_user_id = int(callback.data.split(":")[1])
+    await state.update_data(target_reject_id=target_user_id)
+    await state.set_state(AdminStates.waiting_for_reject_custom)
+
+    await callback.message.reply(
+        f"✏️ Напишите ответным сообщением **причину отказа** для `{target_user_id}`:"
+    )
+    await callback.answer()
+
+
+@dp.message(AdminStates.waiting_for_reject_custom)
+async def process_custom_reject(message: Message, state: FSMContext):
+    data = await state.get_data()
+    target_user_id = data.get("target_reject_id")
+    moderator = message.from_user
+    mod_tag = f"@{moderator.username}" if moderator.username else moderator.full_name
+    custom_reason = message.text
+
+    try:
+        await bot.send_message(
+            chat_id=target_user_id,
+            text=f"❌ **Твоя заявка была отклонена модератором.**\n\n"
+                 f"**Причина:** {custom_reason}\n\n"
+                 f"Попробуй снова через /start, исправив ошибки.",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    await message.answer(
+        f"❌ **Заявка пользователя `{target_user_id}` отклонена.**\n"
+        f"Модератор: {mod_tag}\n"
+        f"Причина: {custom_reason}",
+        parse_mode="Markdown"
+    )
+    await state.clear()
+
+
+@dp.callback_query(F.data.startswith("rj_cancel:"))
+async def mod_reject_cancel(callback: CallbackQuery):
+    target_user_id = callback.data.split(":")[1]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"mod_ok:{target_user_id}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"mod_reject_menu:{target_user_id}")
+        ]
+    ])
+    await callback.message.edit_text(
+        f"📋 Карточка заявки `{target_user_id}`. Выберите действие:",
+        reply_markup=keyboard
+    )
+
+
+# ==================== ТОЧКА ВХОДА С АВТОВОССТАНОВЛЕНИЕМ ====================
+
+async def main():
+    await bot.delete_webhook(drop_pending_updates=False)
+
+    while True:
+        try:
+            print("🟢 Бот успешно запущен и слушает события...")
+            await dp.start_polling(bot, handle_as_tasks=True)
+        except Exception as e:
+            print(f"⚠️ Ошибка сети или разрыв соединения: {e}")
+            print("⏳ Переподключение через 5 секунд...")
+            await asyncio.sleep(5)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
